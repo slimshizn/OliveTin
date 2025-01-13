@@ -3,23 +3,28 @@ syntax = "proto3";
 option go_package = "gen/grpc";
 
 import "google/api/annotations.proto";
+import "google/api/httpbody.proto";
 
 message Action {
 	string id = 1;
 	string title = 2;
 	string icon = 3;
-	bool canExec = 4;
-
+	bool can_exec = 4;
 	repeated ActionArgument arguments = 5;
+	string popup_on_start = 6;
+	int32 order = 7;
 }
 
 message ActionArgument {
 	string name = 1;
-	string title = 2; 
+	string title = 2;
 	string type = 3;
-	string defaultValue = 4;
+	string default_value = 4;
 
 	repeated ActionArgumentChoice choices = 5;
+
+	string description = 6;
+	map<string, string> suggestions = 7;
 }
 
 message ActionArgumentChoice {
@@ -35,16 +40,31 @@ message Entity {
 
 message GetDashboardComponentsResponse {
 	string title = 1;
+
 	repeated Action actions = 2;
 	repeated Entity entities = 3;
+	repeated DashboardComponent dashboards = 4;
+
+	string authenticated_user = 5;
+    string authenticated_user_provider = 6;
 }
 
 message GetDashboardComponentsRequest {}
 
+message DashboardComponent {
+	string title = 1;
+	string type = 2;
+	repeated DashboardComponent contents = 3;
+	string icon = 4;
+	string css_class = 5;
+}
+
 message StartActionRequest {
-	string actionName = 1;
+	string action_id = 1;
 
 	repeated StartActionArgument arguments = 2;
+
+	string unique_tracking_id = 3;
 }
 
 message StartActionArgument {
@@ -53,21 +73,53 @@ message StartActionArgument {
 }
 
 message StartActionResponse {
-	LogEntry logEntry = 1;
+	string execution_tracking_id = 2;
+}
+
+message StartActionAndWaitRequest {
+	string action_id = 1;
+
+	repeated StartActionArgument arguments = 2;
+}
+
+message StartActionAndWaitResponse {
+	LogEntry log_entry = 1;
+}
+
+message StartActionByGetRequest {
+	string action_id = 1;
+}
+
+message StartActionByGetResponse {
+	string execution_tracking_id = 2;
+}
+
+message StartActionByGetAndWaitRequest {
+	string action_id = 1;
+}
+
+message StartActionByGetAndWaitResponse {
+	LogEntry log_entry = 1;
 }
 
 message GetLogsRequest{};
 
 message LogEntry {
-	string datetime = 1;
-	string actionTitle = 2;
-	string stdout = 3;
-	string stderr = 4;
-	bool timedOut = 5;
-	int32 exitCode = 6;
+	string datetime_started = 1;
+	string action_title = 2;
+	string output = 3;
+	bool timed_out = 5;
+	int32 exit_code = 6;
 	string user = 7;
-	string userClass = 8;
-	string actionIcon = 9;
+	string user_class = 8;
+	string action_icon = 9;
+	repeated string tags = 10;
+	string execution_tracking_id = 11;
+	string datetime_finished = 12;
+	string action_id = 13;
+	bool execution_started = 14;
+	bool execution_finished = 15;
+	bool blocked = 16;
 }
 
 message GetLogsResponse {
@@ -84,13 +136,111 @@ message ValidateArgumentTypeResponse {
 	string description = 2;
 }
 
+message WatchExecutionRequest {
+	string execution_tracking_id = 1;
+}
+
+message WatchExecutionUpdate {
+	string update = 1;
+}
+
+message ExecutionStatusRequest {
+	string execution_tracking_id = 1;
+	string action_id = 2;
+}
+
+message ExecutionStatusResponse {
+	LogEntry log_entry = 1;
+}
+
 message WhoAmIRequest {}
 
 message WhoAmIResponse {
-	string authenticatedUser = 1;
+	string authenticated_user = 1;
+    string usergroup = 2;
+    string provider = 3;
+
+    repeated string acls = 4;
+
+    string sid = 5;
 }
 
-service OliveTinApi {
+message SosReportRequest {}
+
+message SosReportResponse {
+	string alert = 1;
+}
+
+message DumpVarsRequest {}
+
+message DumpVarsResponse {
+	string alert = 1;
+	map<string, string> contents = 2;
+}
+
+message ActionEntityPair {
+	string action_title = 1;
+	string entity_prefix = 2;
+}
+
+message DumpPublicIdActionMapRequest {}
+message DumpPublicIdActionMapResponse {
+	string alert = 1;
+	map<string, ActionEntityPair> contents = 2;
+}
+
+message GetReadyzRequest {}
+
+message GetReadyzResponse {
+	string status = 1;
+}
+
+message EventOutputChunk {
+	string execution_tracking_id = 1;
+
+	string output = 2;
+}
+
+message EventEntityChanged {}
+message EventConfigChanged {}
+message EventExecutionFinished {
+	LogEntry log_entry = 1;
+}
+
+message EventExecutionStarted {
+  LogEntry log_entry = 1;
+}
+
+message KillActionRequest {
+	string execution_tracking_id = 1;
+}
+
+message KillActionResponse {
+	string execution_tracking_id = 1;
+	bool killed = 2;
+	bool already_completed = 3;
+	bool found = 4;
+}
+
+message LocalUserLoginRequest {
+    string username = 1;
+    string password = 2;
+}
+
+message LocalUserLoginResponse {
+    bool success = 1;
+}
+
+message PasswordHashRequest {
+    string password = 1;
+}
+
+message PasswordHashResponse {
+}
+
+message LogoutRequest {}
+
+service OliveTinApiService {
 	rpc GetDashboardComponents(GetDashboardComponentsRequest) returns (GetDashboardComponentsResponse) {
 		option (google.api.http) = {
 			get: "/api/GetDashboardComponents"
@@ -100,6 +250,39 @@ service OliveTinApi {
 	rpc StartAction(StartActionRequest) returns (StartActionResponse) {
 		option (google.api.http) = {
 			post: "/api/StartAction"
+			body: "*"
+		};
+	}
+
+	rpc StartActionAndWait(StartActionAndWaitRequest) returns (StartActionAndWaitResponse) {
+		option (google.api.http) = {
+			post: "/api/StartActionAndWait"
+			body: "*"
+		};
+	}
+
+	rpc StartActionByGet(StartActionByGetRequest) returns (StartActionByGetResponse) {
+		option (google.api.http) = {
+			get: "/api/StartActionByGet/{action_id}"
+		};
+	}
+
+	rpc StartActionByGetAndWait(StartActionByGetAndWaitRequest) returns (StartActionByGetAndWaitResponse) {
+		option (google.api.http) = {
+			get: "/api/StartActionByGetAndWait/{action_id}"
+		};
+	}
+
+	rpc KillAction(KillActionRequest) returns (KillActionResponse) {
+		option (google.api.http) = {
+			post: "/api/KillAction"
+			body: "*"
+		};
+	}
+
+	rpc ExecutionStatus(ExecutionStatusRequest) returns (ExecutionStatusResponse) {
+		option (google.api.http) = {
+			post: "/api/ExecutionStatus"
 			body: "*"
 		};
 	}
@@ -122,4 +305,48 @@ service OliveTinApi {
 			get: "/api/WhoAmI"
 		};
 	}
+
+	rpc SosReport(SosReportRequest) returns (google.api.HttpBody) {
+		option (google.api.http) = {
+			get: "/api/sosreport"
+		};
+	}
+
+	rpc DumpVars(DumpVarsRequest) returns (DumpVarsResponse) {
+		option (google.api.http) = {
+			get: "/api/DumpVars"
+		};
+	}
+
+	rpc DumpPublicIdActionMap(DumpPublicIdActionMapRequest) returns (DumpPublicIdActionMapResponse) {
+		option (google.api.http) = {
+			get: "/api/DumpActionMap"
+		};
+	}
+
+	rpc GetReadyz(GetReadyzRequest) returns (GetReadyzResponse) {
+		option (google.api.http) = {
+			get: "/api/readyz"
+		};
+	}
+
+    rpc LocalUserLogin(LocalUserLoginRequest) returns (LocalUserLoginResponse) {
+        option (google.api.http) = {
+            post: "/api/LocalUserLogin"
+            body: "*"
+        };
+    }
+
+    rpc PasswordHash(PasswordHashRequest) returns (google.api.HttpBody) {
+        option (google.api.http) = {
+            post: "/api/PasswordHash"
+            body: "*"
+        };
+    }
+
+    rpc Logout(LogoutRequest) returns (google.api.HttpBody) {
+        option (google.api.http) = {
+            get: "/api/Logout"
+        };
+    }
 }

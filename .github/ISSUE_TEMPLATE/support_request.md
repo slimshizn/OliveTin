@@ -2,7 +2,9 @@
 name: Support request
 about: Need some help? Got an error message?
 title: ""
-labels: support
+labels:
+  - "type: support"
+  - "waiting-on-developer"
 assignees: ''
 
 ---
@@ -11,6 +13,12 @@ assignees: ''
 
 If you are getting an error message, then please copy/paste, or better, provide
 a screenshot to show us exactly what is wrong.
+
+**Can you provide a sosreport?**
+
+A sosreport really helps us to help you, by providing critical information about your install. If you can generate a sosreport, please copy and paste the output here.
+
+How to generate a sosreport: https://docs.olivetin.app/sosreport.html
 
 **What package/file/container did you use to install OliveTin?**
 
@@ -33,7 +41,7 @@ If possible, please copy and paste your OliveTin logs from when the error happen
 **Screenshot of WebDeveloper console logs**
 
 If you know how, and if you think it's relevant, a screenshot of the
-WebDeveloper console from when you clicked a button is often really helpful. 
+WebDeveloper console from when you clicked a button is often really helpful.
 
 **Anything else?**
 

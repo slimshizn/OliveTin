@@ -1,3 +1,4 @@
+---
 name: "Codestyle checks"
 
 on:
@@ -5,7 +6,7 @@ on:
     paths:
       - 'cmd/**'
       - 'internal/**'
-      - 'webui/**'
+      - 'webui.dev/**'
       - 'integration-tests/**'
       - 'OliveTin.proto'
 
@@ -15,18 +16,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Setup Go
-        uses: actions/setup-go@v2
-        with: 
-          go-version: '^1.16.0'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Print go version
+        run: go version
 
       - name: deps
-        run: make grpc
+        run: make -w grpc
 
       - name: daemon
-        run: make daemon-codestyle
+        run: make -w daemon-codestyle
 
       - name: webui
-        run: make webui-codestyle
+        run: make -w webui-codestyle

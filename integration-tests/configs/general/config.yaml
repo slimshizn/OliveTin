@@ -1,0 +1,41 @@
+#
+# Integration Test Config: General
+#
+
+listenAddressSingleHTTPFrontend: 0.0.0.0:1337
+
+logLevel: "DEBUG"
+checkForUpdates: false
+
+actions:
+- title: Ping Google.com
+  shell: ping google.com -c 1
+  icon: ping
+
+- title: restart lightdm
+  icon: poop
+  shell: ssh root@overseer 'service lightdm restart'
+
+- title: sleep 2 seconds
+  shell: sleep 2
+  icon: "&#x1F971"
+
+- title: sleep 5 seconds (timeout)
+  shell: sleep 5
+  icon: "&#x1F62A"
+
+- title: dir-popup
+  shell: dir
+  popupOnStart: execution-dialog-stdout-only
+
+- title: cd-passive
+  shell: cd
+
+- title: "Run Ansible Playbook"
+  icon: "&#x1F1E6"
+  shell: ansible-playbook -i /etc/hosts /root/myRepo/myPlaybook.yaml
+  timeout: 120
+
+- title: Restart Plex
+  icon: smile
+  shell: docker restart plex

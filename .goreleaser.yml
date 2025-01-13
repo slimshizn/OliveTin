@@ -1,8 +1,10 @@
 project_name: OliveTin
+version: 2
 before:
   hooks:
     - go mod download
-    - rm -rf webui/node_modules
+    - go generate ./...
+
 builds:
   - env:
       - CGO_ENABLED=0
@@ -10,15 +12,17 @@ builds:
       - linux
       - windows
       - darwin
+      - freebsd
 
     goarch:
       - amd64
       - arm64
       - arm
+      - riscv64
 
     goarm:
       - 5 # For old RPIs
-      - 6 
+      - 6
       - 7
 
     main: cmd/OliveTin/main.go
@@ -42,26 +46,37 @@ snapshot:
   name_template: "{{ .Branch }}-{{ .ShortCommit }}"
 changelog:
   sort: asc
+  groups:
+    - title: 'Security'
+      regexp: '^.*?security(\([[:word:]]+\))??!?:.+$'
+      order: 0
+    - title: 'Features'
+      regexp: '^.*?feature(\([[:word:]]+\))??!?:.+$'
+      order: 1
+    - title: 'Bug fixes'
+      regexp: '^.*?bugfix(\([[:word:]]+\))??!?:.+$'
+      order: 2
+    - title: Others
+      order: 999
   filters:
     exclude:
       - '^docs:'
       - '^test:'
+      - '^cicd:'
+      - '^refactor:'
 
 archives:
-  - 
+  -
     format: tar.gz
 
-    files: 
+    files:
       - config.yaml
       - LICENSE
       - README.md
       - Dockerfile
       - webui
       - OliveTin.service
-
-    replacements:
-      darwin: macOS
-      arm: arm32v
+      - ./var/
 
     name_template: "{{ .ProjectName }}-{{ .Os }}-{{ .Arch }}{{ .Arm }}"
 
@@ -74,68 +89,62 @@ archives:
 dockers:
   - image_templates:
       - "docker.io/jamesread/olivetin:{{ .Tag }}-amd64"
+      - "ghcr.io/olivetin/olivetin:{{ .Tag }}-amd64"
     dockerfile: Dockerfile
     goos: linux
     goarch: amd64
     skip_push: false
-    
     build_flag_templates:
       - "--platform=linux/amd64"
-      - "--label=org.opencontainers.image.title={{.ProjectName}}"
       - "--label=org.opencontainers.image.revision={{.FullCommit}}"
       - "--label=org.opencontainers.image.version={{.Tag}}"
-      - "--platform=linux/amd64"
     extra_files:
       - webui
+      - var/entities/
+      - config.yaml
+      - var/helper-actions/
 
   - image_templates:
       - "docker.io/jamesread/olivetin:{{ .Tag }}-arm64"
+      - "ghcr.io/olivetin/olivetin:{{ .Tag }}-arm64"
     dockerfile: Dockerfile.arm64
     goos: linux
     goarch: arm64
     skip_push: false
-    
     build_flag_templates:
       - "--platform=linux/arm64"
-      - "--label=org.opencontainers.image.title={{.ProjectName}}"
       - "--label=org.opencontainers.image.revision={{.FullCommit}}"
       - "--label=org.opencontainers.image.version={{.Tag}}"
     extra_files:
       - webui
-
-    # This container image actually uses the goarm v5 binary, because v5 helps
-    # support rpi 1's, but it seems most container images start with v7.
-  - image_templates:
-      - "docker.io/jamesread/olivetin:{{ .Tag }}-armv7"
-    dockerfile: Dockerfile.armv7
-    goos: linux
-    goarch: arm
-    goarm: 7
-    skip_push: false
-    
-    build_flag_templates:
-      - "--platform=linux/arm/v7"
-      - "--label=org.opencontainers.image.title={{.ProjectName}}"
-      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
-      - "--label=org.opencontainers.image.version={{.Tag}}"
-    extra_files:
-      - webui
+      - var/entities/
+      - config.yaml
+      - var/helper-actions/
 
 docker_manifests:
   - name_template: docker.io/jamesread/olivetin:{{ .Version }}
     image_templates:
       - docker.io/jamesread/olivetin:{{ .Version }}-amd64
       - docker.io/jamesread/olivetin:{{ .Version }}-arm64
-      - docker.io/jamesread/olivetin:{{ .Version }}-armv7
 
   - name_template: docker.io/jamesread/olivetin:latest
     image_templates:
       - docker.io/jamesread/olivetin:{{ .Version }}-amd64
       - docker.io/jamesread/olivetin:{{ .Version }}-arm64
-      - docker.io/jamesread/olivetin:{{ .Version }}-armv7
+
+  - name_template: ghcr.io/olivetin/olivetin:{{ .Version }}
+    image_templates:
+      - ghcr.io/olivetin/olivetin:{{ .Version }}-amd64
+      - ghcr.io/olivetin/olivetin:{{ .Version }}-arm64
+
+  - name_template: ghcr.io/olivetin/olivetin:latest
+    image_templates:
+      - ghcr.io/olivetin/olivetin:{{ .Version }}-amd64
+      - ghcr.io/olivetin/olivetin:{{ .Version }}-arm64
 
 nfpms:
-  - maintainer: James Read <contact@jread.com>
+  - id: default
+    maintainer: James Read <contact@jread.com>
     description: OliveTin is a web interface for running Linux shell commands.
     homepage: https://github.com/OliveTin/OliveTin
     license: AGPL-3.0
@@ -145,23 +154,73 @@ nfpms:
 
     bindir: /usr/local/bin/
 
+    file_name_template: '{{ .PackageName }}_{{ .Os }}_{{ .Arch }}{{ with .Arm }}v{{ . }}{{ end }}{{ with .Mips }}_{{ . }}{{ end }}{{ if not (eq .Amd64 "v1") }}{{ .Amd64 }}{{ end }}'
+
     contents:
       - src: OliveTin.service
         dst: /etc/systemd/system/OliveTin.service
 
-      - src: webui
+      - src: webui/*
         dst: /var/www/olivetin/
 
       - src: config.yaml
         dst: /etc/OliveTin/config.yaml
         type: "config|noreplace"
 
+      - src: var/entities/*
+        dst: /etc/OliveTin/entities/
+        type: "config|noreplace"
+
+      - src: var/manpage/OliveTin.1.gz
+        dst: /usr/share/man/man1/OliveTin.1.gz
+
+  - id: openrc
+    maintainer: James Read <contact@jread.com>
+    description: OliveTin is a web interface for running Linux shell commands.
+    homepage: https://github.com/OliveTin/OliveTin
+    license: AGPL-3.0
+    formats:
+      - apk
+
+    bindir: /usr/local/bin/
+
+    file_name_template: '{{ .PackageName }}_{{ .Os }}_{{ .Arch }}{{ with .Arm }}v{{ . }}{{ end }}{{ with .Mips }}_{{ . }}{{ end }}{{ if not (eq .Amd64 "v1") }}{{ .Amd64 }}{{ end }}'
+
+    contents:
+      - src: var/openrc/OliveTin
+        dst: /etc/init.d/OliveTin
+
+      - src: webui/*
+        dst: /var/www/olivetin/
+
+      - src: config.yaml
+        dst: /etc/OliveTin/config.yaml
+        type: "config|noreplace"
+
+      - src: var/entities/*
+        dst: /etc/OliveTin/entities/
+        type: "config|noreplace"
+
+      - src: var/manpage/OliveTin.1.gz
+        dst: /usr/share/man/man1/OliveTin.1.gz
+
 release:
   footer: |
+    ## Container images (from GitHub)
+
+    - `docker pull ghcr.io/olivetin/olivetin:{{ .Version }}`
+
+    ## Container images ([on Docker Hub](https://hub.docker.com/r/jamesread/olivetin/tags?page=1&ordering=last_updated))
+
+    - `docker pull docker.io/jamesread/olivetin:{{ .Version }}`
+
+    ## Upgrade warnings, or breaking changes
+
+    - No such issues between the last release and this version.
+
     ## Useful links
 
     - [Which download do I need?](https://docs.olivetin.app/choose-package.html)
     - [Ask for help and chat with others users in the Discord community](https://discord.gg/jhYWWpNJ3v)
-   
+
     Thanks for your interest in OliveTin!
-  

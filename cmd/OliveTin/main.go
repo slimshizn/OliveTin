@@ -5,16 +5,23 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
+	"github.com/OliveTin/OliveTin/internal/entityfiles"
+	"github.com/OliveTin/OliveTin/internal/executor"
 	grpcapi "github.com/OliveTin/OliveTin/internal/grpcapi"
-	updatecheck "github.com/OliveTin/OliveTin/internal/updatecheck"
-
 	"github.com/OliveTin/OliveTin/internal/httpservers"
+	"github.com/OliveTin/OliveTin/internal/installationinfo"
+	"github.com/OliveTin/OliveTin/internal/oncalendarfile"
+	"github.com/OliveTin/OliveTin/internal/oncron"
+	"github.com/OliveTin/OliveTin/internal/onfileindir"
+	"github.com/OliveTin/OliveTin/internal/onstartup"
+	updatecheck "github.com/OliveTin/OliveTin/internal/updatecheck"
+	"github.com/OliveTin/OliveTin/internal/websocket"
 
 	config "github.com/OliveTin/OliveTin/internal/config"
 	"github.com/fsnotify/fsnotify"
 	"github.com/spf13/viper"
 	"os"
-	"path"
+	"strconv"
 )
 
 var (
@@ -25,27 +32,78 @@ var (
 )
 
 func init() {
+	initLog()
+
+	initViperConfig(initCliFlags())
+
+	initCheckEnvironment()
+
+	initInstallationInfo()
+
+	log.Info("OliveTin initialization complete")
+}
+
+func initLog() {
 	log.SetFormatter(&log.TextFormatter{
 		ForceQuote:       true,
 		DisableTimestamp: true,
 	})
 
-	log.WithFields(log.Fields{
-		"version": version,
-		"commit":  commit,
-		"date":    date,
-	}).Info("OliveTin initializing")
+	// Use debug this early on to catch details about startup errors. The
+	// default config will raise the log level later, if not set.
+	log.SetLevel(log.DebugLevel) // Default to debug, to catch cfg issue
+}
 
-	log.SetLevel(log.DebugLevel) // Default to debug, to catch cfg issues
-
+func initCliFlags() string {
 	var configDir string
 	flag.StringVar(&configDir, "configdir", ".", "Config directory path")
+
+	var printVersion bool
+	flag.BoolVar(&printVersion, "version", false, "Prints the version number and exits")
 	flag.Parse()
+
+	// This log message should be the first log message OliveTin prints.
+	if printVersion {
+		logStartupMessage("OliveTin is just printing the startup message")
+		os.Exit(1)
+	} else {
+		logStartupMessage("OliveTin initializing")
+	}
 
 	log.WithFields(log.Fields{
 		"value": configDir,
 	}).Debugf("Value of -configdir flag")
 
+	return configDir
+}
+
+func getBasePort() int {
+	var err error
+
+	defaultPort := 1337
+	basePort := defaultPort
+
+	envPort := os.Getenv("PORT")
+
+	if envPort != "" {
+		basePort, err = strconv.Atoi(os.Getenv("PORT"))
+
+		if err != nil {
+			log.Errorf("Error converting port to int. %s", err)
+			os.Exit(1)
+		}
+	}
+
+	if defaultPort != basePort {
+		log.WithFields(log.Fields{
+			"basePort": basePort,
+		}).Debug("Base port")
+	}
+
+	return basePort
+}
+
+func initViperConfig(configDir string) {
 	viper.AutomaticEnv()
 	viper.SetConfigName("config.yaml")
 	viper.SetConfigType("yaml")
@@ -58,22 +116,37 @@ func init() {
 		os.Exit(1)
 	}
 
-	cfg = config.DefaultConfig()
+	cfg = config.DefaultConfigWithBasePort(getBasePort())
 
 	viper.WatchConfig()
 	viper.OnConfigChange(func(e fsnotify.Event) {
 		if e.Op == fsnotify.Write {
 			log.Info("Config file changed:", e.String())
 
-			reloadConfig()
+			config.Reload(cfg)
 		}
 	})
 
-	reloadConfig()
+	config.Reload(cfg)
+}
 
+func initInstallationInfo() {
+	installationinfo.Config = cfg
+	installationinfo.Build.Version = version
+	installationinfo.Build.Commit = commit
+	installationinfo.Build.Date = date
+}
+
+func logStartupMessage(message string) {
+	log.WithFields(log.Fields{
+		"version": version,
+		"commit":  commit,
+		"date":    date,
+	}).Info(message)
+}
+
+func initCheckEnvironment() {
 	warnIfPuidGuid()
-
-	log.Info("Init complete")
 }
 
 func warnIfPuidGuid() {
@@ -82,27 +155,30 @@ func warnIfPuidGuid() {
 	}
 }
 
-func reloadConfig() {
-	if err := viper.UnmarshalExact(&cfg); err != nil {
-		log.Errorf("Config unmarshal error %+v", err)
-		os.Exit(1)
-	}
-
-	cfg.Sanitize()
-}
-
 func main() {
-	configDir := path.Dir(viper.ConfigFileUsed())
-
 	log.WithFields(log.Fields{
-		"configDir": configDir,
+		"configDir": cfg.GetDir(),
 	}).Infof("OliveTin started")
 
 	log.Debugf("Config: %+v", cfg)
 
-	go updatecheck.StartUpdateChecker(version, commit, cfg, configDir)
+	executor := executor.DefaultExecutor(cfg)
+	executor.RebuildActionMap()
+	executor.AddListener(websocket.ExecutionListener)
+	config.AddListener(executor.RebuildActionMap)
 
-	go grpcapi.Start(cfg)
+	go onstartup.Execute(cfg, executor)
+	go oncron.Schedule(cfg, executor)
+	go onfileindir.WatchFilesInDirectory(cfg, executor)
+	go oncalendarfile.Schedule(cfg, executor)
+
+	entityfiles.AddListener(websocket.OnEntityChanged)
+	entityfiles.AddListener(executor.RebuildActionMap)
+	go entityfiles.SetupEntityFileWatchers(cfg)
+
+	go updatecheck.StartUpdateChecker(cfg)
+
+	go grpcapi.Start(cfg, executor)
 
 	httpservers.StartServers(cfg)
 }

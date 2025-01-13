@@ -1,15 +1,22 @@
 {
   "name": "olivetin-integration-tests",
   "version": "1.0.0",
-  "repository": "https://github.com/OliveTin/OliveTin-integration-tests",
-  "description": "The cypress WebUI tests",
+  "repository": "https://github.com/OliveTin/OliveTin",
+  "description": "The integration-tests for OliveTin's webui.",
   "main": "index.js",
+  "type": "module",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "author": "",
-  "license": "ISC",
+  "license": "AGPL-3.0-only",
+  "devDependencies": {
+    "chai": "^5.1.0",
+    "eslint": "^8.51.0",
+    "mocha": "^10.4.0",
+    "selenium-webdriver": "^4.19.0"
+  },
   "dependencies": {
-    "cypress": "^8.3.0"
+    "wait-on": "^7.2.0"
   }
 }

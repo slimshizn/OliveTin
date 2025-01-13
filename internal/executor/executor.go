@@ -1,181 +1,354 @@
 package executor
 
 import (
-	pb "github.com/OliveTin/OliveTin/gen/grpc"
 	acl "github.com/OliveTin/OliveTin/internal/acl"
 	config "github.com/OliveTin/OliveTin/internal/config"
+	sv "github.com/OliveTin/OliveTin/internal/stringvariables"
+	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"gopkg.in/yaml.v3"
 
 	"bytes"
 	"context"
-	"errors"
-	"os/exec"
-	"regexp"
+	"fmt"
+	"os"
+	"path"
 	"strings"
+	"sync"
 	"time"
 )
 
 var (
-	typecheckRegex = map[string]string{
-		"very_dangerous_raw_string": "",
-		"int":                       "^[\\d]+$",
-		"ascii":                     "^[a-zA-Z0-9]+$",
-		"ascii_identifier":          "^[a-zA-Z0-9\\-\\.\\_]+$",
-		"ascii_sentence":            "^[a-zA-Z0-9 \\,\\.]+$",
-	}
+	metricActionsRequested = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "olivetin_actions_requested_count",
+		Help: "The actions requested count",
+	})
 )
 
-// InternalLogEntry objects are created by an Executor, and represent the final
-// state of execution (even if the command is not executed). It's designed to be
-// easily serializable.
-type InternalLogEntry struct {
-	Datetime string
-	Stdout   string
-	Stderr   string
-	TimedOut bool
-	ExitCode int32
-
-	/*
-		The following two properties are obviously on Action normally, but it's useful
-		that logs are lightweight (so we don't need to have an action associated to
-		logs, etc. Therefore, we duplicate those values here.
-	*/
-	ActionTitle string
-	ActionIcon  string
-}
-
-// ExecutionRequest is a request to execute an action. It's passed to an
-// Executor. They're created from the grpcapi.
-type ExecutionRequest struct {
-	ActionName         string
-	Arguments          map[string]string
-	action             *config.Action
-	Cfg                *config.Config
-	AuthenticatedUser  *acl.AuthenticatedUser
-	logEntry           *InternalLogEntry
-	finalParsedCommand string
-}
-
-type executorStep interface {
-	Exec(*ExecutionRequest) bool
+type ActionBinding struct {
+	Action       *config.Action
+	EntityPrefix string
+	ConfigOrder  int
 }
 
 // Executor represents a helper class for executing commands. It's main method
 // is ExecRequest
 type Executor struct {
-	Logs []InternalLogEntry
+	logs           map[string]*InternalLogEntry
+	LogsByActionId map[string][]*InternalLogEntry
 
-	chainOfCommand []executorStep
+	logmutex sync.RWMutex
+
+	MapActionIdToBinding     map[string]*ActionBinding
+	MapActionIdToBindingLock sync.RWMutex
+
+	Cfg *config.Config
+
+	listeners []listener
+
+	chainOfCommand []executorStepFunc
 }
+
+// ExecutionRequest is a request to execute an action. It's passed to an
+// Executor. They're created from the grpcapi.
+type ExecutionRequest struct {
+	ActionTitle       string
+	Action            *config.Action
+	Arguments         map[string]string
+	TrackingID        string
+	Tags              []string
+	Cfg               *config.Config
+	AuthenticatedUser *acl.AuthenticatedUser
+	EntityPrefix      string
+
+	logEntry           *InternalLogEntry
+	finalParsedCommand string
+	executor           *Executor
+}
+
+// InternalLogEntry objects are created by an Executor, and represent the final
+// state of execution (even if the command is not executed). It's designed to be
+// easily serializable.
+type InternalLogEntry struct {
+	DatetimeStarted     time.Time
+	DatetimeFinished    time.Time
+	Output              string
+	TimedOut            bool
+	Blocked             bool
+	ExitCode            int32
+	Tags                []string
+	ExecutionStarted    bool
+	ExecutionFinished   bool
+	ExecutionTrackingID string
+	Process             *os.Process
+	Username            string
+
+	/*
+		The following 3 properties are obviously on Action normally, but it's useful
+		that logs are lightweight (so we don't need to have an action associated to
+		logs, etc. Therefore, we duplicate those values here.
+	*/
+	ActionTitle string
+	ActionIcon  string
+	ActionId    string
+}
+
+type executorStepFunc func(*ExecutionRequest) bool
 
 // DefaultExecutor returns an Executor, with a sensible "chain of command" for
 // executing actions.
-func DefaultExecutor() *Executor {
+func DefaultExecutor(cfg *config.Config) *Executor {
 	e := Executor{}
-	e.chainOfCommand = []executorStep{
-		stepFindAction{},
-		stepACLCheck{},
-		stepParseArgs{},
-		stepLogStart{},
-		stepExec{},
-		stepLogFinish{},
+	e.Cfg = cfg
+	e.logs = make(map[string]*InternalLogEntry)
+	e.LogsByActionId = make(map[string][]*InternalLogEntry)
+	e.MapActionIdToBinding = make(map[string]*ActionBinding)
+
+	e.chainOfCommand = []executorStepFunc{
+		stepRequestAction,
+		stepConcurrencyCheck,
+		stepRateCheck,
+		stepACLCheck,
+		stepParseArgs,
+		stepLogStart,
+		stepExec,
+		stepExecAfter,
+		stepLogFinish,
+		stepSaveLog,
+		stepTrigger,
 	}
 
 	return &e
 }
 
-type stepFindAction struct{}
-
-func (s stepFindAction) Exec(req *ExecutionRequest) bool {
-	actualAction := req.Cfg.FindAction(req.ActionName)
-
-	if actualAction == nil {
-		log.WithFields(log.Fields{
-			"actionName": req.ActionName,
-		}).Warnf("Action not found")
-
-		req.logEntry.Stderr = "Action not found"
-
-		return false
-	}
-
-	req.action = actualAction
-	req.logEntry.ActionIcon = actualAction.Icon
-
-	return true
+type listener interface {
+	OnExecutionStarted(logEntry *InternalLogEntry)
+	OnExecutionFinished(logEntry *InternalLogEntry)
+	OnOutputChunk(o []byte, executionTrackingId string)
+	OnActionMapRebuilt()
 }
 
-type stepACLCheck struct{}
+func (e *Executor) AddListener(m listener) {
+	e.listeners = append(e.listeners, m)
+}
 
-func (s stepACLCheck) Exec(req *ExecutionRequest) bool {
-	return acl.IsAllowedExec(req.Cfg, req.AuthenticatedUser, req.action)
+func (e *Executor) GetLogsCopy() map[string]*InternalLogEntry {
+	e.logmutex.RLock()
+
+	copy := make(map[string]*InternalLogEntry)
+
+	for k, v := range e.logs {
+		copy[k] = v
+	}
+
+	e.logmutex.RUnlock()
+
+	return copy
+}
+
+func (e *Executor) GetLog(trackingID string) (*InternalLogEntry, bool) {
+	e.logmutex.RLock()
+
+	entry, found := e.logs[trackingID]
+
+	e.logmutex.RUnlock()
+
+	return entry, found
+}
+
+func (e *Executor) GetLogsByActionId(actionId string) []*InternalLogEntry {
+	e.logmutex.RLock()
+
+	logs, found := e.LogsByActionId[actionId]
+
+	e.logmutex.RUnlock()
+
+	if !found {
+		return make([]*InternalLogEntry, 0)
+	}
+
+	return logs
+}
+
+func (e *Executor) SetLog(trackingID string, entry *InternalLogEntry) {
+	e.logmutex.Lock()
+
+	e.logs[trackingID] = entry
+
+	e.logmutex.Unlock()
 }
 
 // ExecRequest processes an ExecutionRequest
-func (e *Executor) ExecRequest(req *ExecutionRequest) *pb.StartActionResponse {
-	req.logEntry = &InternalLogEntry{
-		Datetime:    time.Now().Format("2006-01-02 15:04:05"),
-		ActionTitle: req.ActionName,
-		Stdout:      "",
-		Stderr:      "",
-		ExitCode:    -1337, // If an Action is not actually executed, this is the default exit code.
+func (e *Executor) ExecRequest(req *ExecutionRequest) (*sync.WaitGroup, string) {
+	if req.AuthenticatedUser == nil {
+		req.AuthenticatedUser = acl.UserGuest(req.Cfg)
 	}
 
+	req.executor = e
+	req.logEntry = &InternalLogEntry{
+		DatetimeStarted:     time.Now(),
+		ExecutionTrackingID: req.TrackingID,
+		Output:              "",
+		ExitCode:            -1337, // If an Action is not actually executed, this is the default exit code.
+		ExecutionStarted:    false,
+		ExecutionFinished:   false,
+		ActionId:            "",
+		ActionTitle:         "notfound",
+		ActionIcon:          "&#x1f4a9;",
+		Username:            req.AuthenticatedUser.Username,
+	}
+
+	_, isDuplicate := e.GetLog(req.TrackingID)
+
+	if isDuplicate || req.TrackingID == "" {
+		req.TrackingID = uuid.NewString()
+	}
+
+	log.Tracef("executor.ExecRequest(): %v", req)
+
+	e.SetLog(req.TrackingID, req.logEntry)
+
+	wg := new(sync.WaitGroup)
+	wg.Add(1)
+
+	go func() {
+		e.execChain(req)
+		defer wg.Done()
+	}()
+
+	return wg, req.TrackingID
+}
+
+func (e *Executor) execChain(req *ExecutionRequest) {
 	for _, step := range e.chainOfCommand {
-		if !step.Exec(req) {
+		if !step(req) {
 			break
 		}
 	}
 
-	e.Logs = append(e.Logs, *req.logEntry)
+	req.logEntry.ExecutionFinished = true
 
-	return &pb.StartActionResponse{
-		LogEntry: &pb.LogEntry{
-			ActionTitle: req.logEntry.ActionTitle,
-			ActionIcon:  req.logEntry.ActionIcon,
-			Datetime:    req.logEntry.Datetime,
-			Stderr:      req.logEntry.Stderr,
-			Stdout:      req.logEntry.Stdout,
-			TimedOut:    req.logEntry.TimedOut,
-			ExitCode:    req.logEntry.ExitCode,
-		},
+	// This isn't a step, because we want to notify all listeners, irrespective
+	// of how many steps were actually executed.
+	notifyListenersFinished(req)
+}
+
+func getConcurrentCount(req *ExecutionRequest) int {
+	concurrentCount := 0
+
+	req.executor.logmutex.RLock()
+
+	for _, log := range req.executor.GetLogsByActionId(req.Action.ID) {
+		if !log.ExecutionFinished {
+			concurrentCount += 1
+		}
 	}
+
+	req.executor.logmutex.RUnlock()
+
+	return concurrentCount
 }
 
-type stepLogStart struct{}
+func stepConcurrencyCheck(req *ExecutionRequest) bool {
+	concurrentCount := getConcurrentCount(req)
 
-func (e stepLogStart) Exec(req *ExecutionRequest) bool {
-	log.WithFields(log.Fields{
-		"title":   req.action.Title,
-		"timeout": req.action.Timeout,
-	}).Infof("Action starting")
+	// Note that the current execution is counted int the logs, so when checking we +1
+	if concurrentCount >= (req.Action.MaxConcurrent + 1) {
+		msg := fmt.Sprintf("Blocked from executing. This would mean this action is running %d times concurrently, but this action has maxExecutions set to %d.", concurrentCount, req.Action.MaxConcurrent)
+
+		log.WithFields(log.Fields{
+			"actionTitle": req.logEntry.ActionTitle,
+		}).Warnf(msg)
+
+		req.logEntry.Output = msg
+		req.logEntry.Blocked = true
+		return false
+	}
 
 	return true
 }
 
-type stepLogFinish struct{}
-
-func (e stepLogFinish) Exec(req *ExecutionRequest) bool {
-	log.WithFields(log.Fields{
-		"title":    req.action.Title,
-		"stdout":   req.logEntry.Stdout,
-		"stderr":   req.logEntry.Stderr,
-		"timedOut": req.logEntry.TimedOut,
-		"exit":     req.logEntry.ExitCode,
-	}).Infof("Action finished")
-
-	return true
-}
-
-type stepParseArgs struct{}
-
-func (e stepParseArgs) Exec(req *ExecutionRequest) bool {
-	var err error
-
-	req.finalParsedCommand, err = parseActionArguments(req.action.Shell, req.Arguments, req.action)
+func parseDuration(rate config.RateSpec) time.Duration {
+	duration, err := time.ParseDuration(rate.Duration)
 
 	if err != nil {
-		req.logEntry.Stdout = err.Error()
+		log.Warnf("Could not parse duration: %v", rate.Duration)
+
+		return -1 * time.Minute
+	}
+
+	return duration
+}
+
+func getExecutionsCount(rate config.RateSpec, req *ExecutionRequest) int {
+	executions := -1 // Because we will find ourself when checking execution logs
+
+	duration := parseDuration(rate)
+
+	then := time.Now().Add(-duration)
+
+	for _, logEntry := range req.executor.GetLogsByActionId(req.Action.ID) {
+		if logEntry.DatetimeStarted.After(then) && !logEntry.Blocked {
+
+			executions += 1
+		}
+	}
+
+	return executions
+}
+
+func stepRateCheck(req *ExecutionRequest) bool {
+	for _, rate := range req.Action.MaxRate {
+		executions := getExecutionsCount(rate, req)
+
+		if executions >= rate.Limit {
+			msg := fmt.Sprintf("Blocked from executing. This action has run %d out of %d allowed times in the last %s.", executions, rate.Limit, rate.Duration)
+
+			log.WithFields(log.Fields{
+				"actionTitle": req.logEntry.ActionTitle,
+			}).Infof(msg)
+
+			req.logEntry.Output = msg
+			req.logEntry.Blocked = true
+			return false
+		}
+	}
+
+	return true
+}
+
+func stepACLCheck(req *ExecutionRequest) bool {
+	canExec := acl.IsAllowedExec(req.Cfg, req.AuthenticatedUser, req.Action)
+
+	if !canExec {
+		req.logEntry.Output = "ACL check failed. Blocked from executing."
+		req.logEntry.Blocked = true
+
+		log.WithFields(log.Fields{
+			"actionTitle": req.logEntry.ActionTitle,
+		}).Warnf("ACL check failed. Blocked from executing.")
+	}
+
+	return canExec
+}
+
+func stepParseArgs(req *ExecutionRequest) bool {
+	var err error
+
+	if req.Arguments == nil {
+		req.Arguments = make(map[string]string)
+	}
+
+	req.Arguments["ot_executionTrackingId"] = req.TrackingID
+	req.Arguments["ot_username"] = req.AuthenticatedUser.Username
+
+	req.finalParsedCommand, err = parseActionArguments(req.Action.Shell, req.Arguments, req.Action, req.logEntry.ActionTitle, req.EntityPrefix)
+
+	if err != nil {
+		req.logEntry.Output = err.Error()
 
 		log.Warnf(err.Error())
 
@@ -185,118 +358,289 @@ func (e stepParseArgs) Exec(req *ExecutionRequest) bool {
 	return true
 }
 
-type stepExec struct{}
+func stepRequestAction(req *ExecutionRequest) bool {
+	// The grpc API always tries to find the action by ID, but it may
+	if req.Action == nil {
+		log.WithFields(log.Fields{
+			"actionTitle": req.ActionTitle,
+		}).Infof("Action finding by title")
 
-func (e stepExec) Exec(req *ExecutionRequest) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(req.action.Timeout)*time.Second)
+		req.Action = req.Cfg.FindAction(req.ActionTitle)
+
+		if req.Action == nil {
+			log.WithFields(log.Fields{
+				"actionTitle": req.ActionTitle,
+			}).Warnf("Action requested, but not found")
+
+			req.logEntry.Output = "Action not found: " + req.ActionTitle
+
+			return false
+		}
+	}
+
+	metricActionsRequested.Inc()
+
+	req.logEntry.ActionTitle = sv.ReplaceEntityVars(req.EntityPrefix, req.Action.Title)
+	req.logEntry.ActionIcon = req.Action.Icon
+	req.logEntry.ActionId = req.Action.ID
+	req.logEntry.Tags = req.Tags
+
+	req.executor.logmutex.Lock()
+
+	if _, containsKey := req.executor.LogsByActionId[req.Action.ID]; !containsKey {
+		req.executor.LogsByActionId[req.Action.ID] = make([]*InternalLogEntry, 0)
+	}
+
+	req.executor.LogsByActionId[req.Action.ID] = append(req.executor.LogsByActionId[req.Action.ID], req.logEntry)
+
+	req.executor.logmutex.Unlock()
+
+	log.WithFields(log.Fields{
+		"actionTitle": req.logEntry.ActionTitle,
+		"tags":        req.Tags,
+	}).Infof("Action requested")
+
+	notifyListenersStarted(req)
+
+	return true
+}
+
+func stepLogStart(req *ExecutionRequest) bool {
+	log.WithFields(log.Fields{
+		"actionTitle": req.logEntry.ActionTitle,
+		"timeout":     req.Action.Timeout,
+	}).Infof("Action started")
+
+	return true
+}
+
+func stepLogFinish(req *ExecutionRequest) bool {
+	req.logEntry.ExecutionFinished = true
+
+	log.WithFields(log.Fields{
+		"actionTitle":  req.logEntry.ActionTitle,
+		"outputLength": len(req.logEntry.Output),
+		"timedOut":     req.logEntry.TimedOut,
+		"exit":         req.logEntry.ExitCode,
+	}).Infof("Action finished")
+
+	return true
+}
+
+func notifyListenersFinished(req *ExecutionRequest) {
+	for _, listener := range req.executor.listeners {
+		listener.OnExecutionFinished(req.logEntry)
+	}
+}
+
+func notifyListenersStarted(req *ExecutionRequest) {
+	for _, listener := range req.executor.listeners {
+		listener.OnExecutionStarted(req.logEntry)
+	}
+}
+
+func appendErrorToStderr(err error, logEntry *InternalLogEntry) {
+	if err != nil {
+		logEntry.Output = err.Error() + "\n\n" + logEntry.Output
+	}
+}
+
+type OutputStreamer struct {
+	Req    *ExecutionRequest
+	output bytes.Buffer
+}
+
+func (ost *OutputStreamer) Write(o []byte) (n int, err error) {
+	for _, listener := range ost.Req.executor.listeners {
+		listener.OnOutputChunk(o, ost.Req.TrackingID)
+	}
+
+	return ost.output.Write(o)
+}
+
+func (ost *OutputStreamer) String() string {
+	return ost.output.String()
+}
+
+func buildEnv(args map[string]string) []string {
+	ret := append(os.Environ(), "OLIVETIN=1")
+
+	for k, v := range args {
+		varName := fmt.Sprintf("%v", strings.TrimSpace(strings.ToUpper(k)))
+
+		// Skip arguments that might not have a name (eg, confirmation), as this causes weird bugs on Windows.
+		if varName == "" {
+			continue
+		}
+
+		ret = append(ret, fmt.Sprintf("%v=%v", varName, v))
+	}
+
+	return ret
+}
+
+func stepExec(req *ExecutionRequest) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(req.Action.Timeout)*time.Second)
+	defer cancel()
+
+	streamer := &OutputStreamer{Req: req}
+
+	cmd := wrapCommandInShell(ctx, req.finalParsedCommand)
+	cmd.Stdout = streamer
+	cmd.Stderr = streamer
+	cmd.Env = buildEnv(req.Arguments)
+
+	req.logEntry.ExecutionStarted = true
+
+	runerr := cmd.Start()
+
+	req.logEntry.Process = cmd.Process
+
+	waiterr := cmd.Wait()
+
+	req.logEntry.ExitCode = int32(cmd.ProcessState.ExitCode())
+	req.logEntry.Output = streamer.String()
+
+	appendErrorToStderr(runerr, req.logEntry)
+	appendErrorToStderr(waiterr, req.logEntry)
+
+	if ctx.Err() == context.DeadlineExceeded {
+		log.WithFields(log.Fields{
+			"actionTitle": req.logEntry.ActionTitle,
+		}).Warnf("Action timed out")
+
+		// The context timeout should kill the process, but let's make sure.
+		req.executor.Kill(req.logEntry)
+		req.logEntry.TimedOut = true
+		req.logEntry.Output += "OliveTin::timeout - this action timed out after " + fmt.Sprintf("%v", req.Action.Timeout) + " seconds. If you need more time for this action, set a longer timeout. See https://docs.olivetin.app/timeout.html for more help."
+	}
+
+	req.logEntry.DatetimeFinished = time.Now()
+
+	return true
+}
+
+func stepExecAfter(req *ExecutionRequest) bool {
+	if req.Action.ShellAfterCompleted == "" {
+		return true
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(req.Action.Timeout)*time.Second)
 	defer cancel()
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 
-	cmd := exec.CommandContext(ctx, "sh", "-c", req.finalParsedCommand)
+	args := map[string]string{
+		"output":                 req.logEntry.Output,
+		"exitCode":               fmt.Sprintf("%v", req.logEntry.ExitCode),
+		"ot_executionTrackingId": req.TrackingID,
+		"ot_username":            req.AuthenticatedUser.Username,
+	}
+
+	finalParsedCommand, _, err := parseCommandForReplacements(req.Action.ShellAfterCompleted, args)
+
+	if err != nil {
+		msg := "Could not prepare shellAfterCompleted command: " + err.Error() + "\n"
+		req.logEntry.Output += msg
+		log.Warnf(msg)
+		return true
+	}
+
+	cmd := wrapCommandInShell(ctx, finalParsedCommand)
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	runerr := cmd.Run()
+	cmd.Env = buildEnv(args)
 
-	req.logEntry.ExitCode = int32(cmd.ProcessState.ExitCode())
-	req.logEntry.Stdout = stdout.String()
-	req.logEntry.Stderr = stderr.String()
+	runerr := cmd.Start()
 
-	if runerr != nil {
-		req.logEntry.Stderr = runerr.Error() + "\n\n" + req.logEntry.Stderr
-	}
+	waiterr := cmd.Wait()
+
+	req.logEntry.Output += "\n"
+	req.logEntry.Output += "OliveTin::shellAfterCompleted stdout\n"
+	req.logEntry.Output += stdout.String()
+
+	req.logEntry.Output += "OliveTin::shellAfterCompleted stderr\n"
+	req.logEntry.Output += stderr.String()
+
+	req.logEntry.Output += "OliveTin::shellAfterCompleted errors and summary\n"
+	appendErrorToStderr(runerr, req.logEntry)
+	appendErrorToStderr(waiterr, req.logEntry)
 
 	if ctx.Err() == context.DeadlineExceeded {
-		req.logEntry.TimedOut = true
+		req.logEntry.Output += "Your shellAfterCompleted command timed out."
+	}
+
+	req.logEntry.Output += fmt.Sprintf("Your shellAfterCompleted exited with code %v\n", cmd.ProcessState.ExitCode())
+
+	req.logEntry.Output += "OliveTin::shellAfterCompleted output complete\n"
+
+	return true
+}
+
+func stepTrigger(req *ExecutionRequest) bool {
+	if req.Action.Trigger != "" {
+		trigger := &ExecutionRequest{
+			ActionTitle:       req.Action.Trigger,
+			TrackingID:        uuid.NewString(),
+			Tags:              []string{"trigger"},
+			AuthenticatedUser: req.AuthenticatedUser,
+			Cfg:               req.Cfg,
+		}
+
+		req.executor.ExecRequest(trigger)
 	}
 
 	return true
 }
 
-func parseActionArguments(rawShellCommand string, values map[string]string, action *config.Action) (string, error) {
-	log.WithFields(log.Fields{
-		"cmd": rawShellCommand,
-	}).Infof("Before Parse Args")
+func stepSaveLog(req *ExecutionRequest) bool {
+	filename := fmt.Sprintf("%v.%v.%v", req.logEntry.ActionTitle, req.logEntry.DatetimeStarted.Unix(), req.logEntry.ExecutionTrackingID)
 
-	r := regexp.MustCompile("{{ *?([a-zA-Z0-9_]+?) *?}}")
-	matches := r.FindAllStringSubmatch(rawShellCommand, -1)
+	saveLogResults(req, filename)
+	saveLogOutput(req, filename)
 
-	for _, match := range matches {
-		argValue, argProvided := values[match[1]]
+	return true
+}
 
-		if !argProvided {
-			log.Infof("%v", values)
-			return "", errors.New("Required arg not provided: " + match[1])
-		}
+func firstNonEmpty(one, two string) string {
+	if one != "" {
+		return one
+	}
 
-		err := typecheckActionArgument(match[1], argValue, action)
+	return two
+}
+
+func saveLogResults(req *ExecutionRequest, filename string) {
+	dir := firstNonEmpty(req.Action.SaveLogs.ResultsDirectory, req.Cfg.SaveLogs.ResultsDirectory)
+
+	if dir != "" {
+		data, err := yaml.Marshal(req.logEntry)
 
 		if err != nil {
-			return "", err
+			log.Warnf("%v", err)
 		}
 
-		log.WithFields(log.Fields{
-			"name":  match[1],
-			"value": argValue,
-		}).Debugf("Arg assigned")
+		filepath := path.Join(dir, filename+".yaml")
+		err = os.WriteFile(filepath, data, 0644)
 
-		rawShellCommand = strings.ReplaceAll(rawShellCommand, match[0], argValue)
-	}
-
-	log.WithFields(log.Fields{
-		"cmd": rawShellCommand,
-	}).Infof("After Parse Args")
-
-	return rawShellCommand, nil
-}
-
-func typecheckActionArgument(name string, value string, action *config.Action) error {
-	arg := action.FindArg(name)
-
-	if arg == nil {
-		return errors.New("Action arg not defined: " + name)
-	}
-
-	if len(arg.Choices) > 0 {
-		return typecheckChoice(value, arg)
-	}
-
-	return TypeSafetyCheck(name, value, arg.Type)
-}
-
-func typecheckChoice(value string, arg *config.ActionArgument) error {
-	for _, choice := range arg.Choices {
-		if value == choice.Value {
-			return nil
+		if err != nil {
+			log.Warnf("%v", err)
 		}
 	}
-
-	return errors.New("argument value is not one of the predefined choices")
 }
 
-// TypeSafetyCheck checks argument values match a specific type. The types are
-// defined in typecheckRegex, and, you guessed it, uses regex to check for allowed
-// characters.
-func TypeSafetyCheck(name string, value string, typ string) error {
-	pattern, found := typecheckRegex[typ]
+func saveLogOutput(req *ExecutionRequest, filename string) {
+	dir := firstNonEmpty(req.Action.SaveLogs.OutputDirectory, req.Cfg.SaveLogs.OutputDirectory)
 
-	if !found {
-		return errors.New("argument type not implemented " + typ)
+	if dir != "" {
+		data := req.logEntry.Output
+		filepath := path.Join(dir, filename+".log")
+		err := os.WriteFile(filepath, []byte(data), 0644)
+
+		if err != nil {
+			log.Warnf("%v", err)
+		}
 	}
-
-	matches, _ := regexp.MatchString(pattern, value)
-
-	if !matches {
-		log.WithFields(log.Fields{
-			"name":  name,
-			"type":  typ,
-			"value": value,
-		}).Warn("Arg type check safety failure")
-
-		return errors.New("invalid argument, doesn't match " + typ)
-	}
-
-	return nil
 }

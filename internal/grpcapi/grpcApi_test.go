@@ -14,29 +14,34 @@ import (
 
 	pb "github.com/OliveTin/OliveTin/gen/grpc"
 	config "github.com/OliveTin/OliveTin/internal/config"
+	"github.com/OliveTin/OliveTin/internal/executor"
 )
 
 const bufSize = 1024 * 1024
 
 var lis *bufconn.Listener
 
-func init() {
+func initServer(cfg *config.Config) *executor.Executor {
+	ex := executor.DefaultExecutor(cfg)
+
 	lis = bufconn.Listen(bufSize)
 	s := grpc.NewServer()
-	pb.RegisterOliveTinApiServer(s, newServer())
+	pb.RegisterOliveTinApiServiceServer(s, newServer(ex))
 
 	go func() {
 		if err := s.Serve(lis); err != nil {
 			log.Fatalf("Server exited with error: %v", err)
 		}
 	}()
+
+	return ex
 }
 
 func bufDialer(context.Context, string) (net.Conn, error) {
 	return lis.Dial()
 }
 
-func getNewTestServerAndClient(t *testing.T, injectedConfig *config.Config) (*grpc.ClientConn, pb.OliveTinApiClient) {
+func getNewTestServerAndClient(t *testing.T, injectedConfig *config.Config) (*grpc.ClientConn, pb.OliveTinApiServiceClient) {
 	cfg = injectedConfig
 
 	ctx := context.Background()
@@ -47,17 +52,23 @@ func getNewTestServerAndClient(t *testing.T, injectedConfig *config.Config) (*gr
 		t.Fatalf("Failed to dial bufnet: %v", err)
 	}
 
-	client := pb.NewOliveTinApiClient(conn)
+	client := pb.NewOliveTinApiServiceClient(conn)
 
 	return conn, client
 }
 
 func TestGetActionsAndStart(t *testing.T) {
 	cfg = config.DefaultConfig()
-	btn1 := config.Action{}
+
+	ex := initServer(cfg)
+
+	btn1 := &config.Action{}
 	btn1.Title = "blat"
+	btn1.ID = "blat"
 	btn1.Shell = "echo 'test'"
 	cfg.Actions = append(cfg.Actions, btn1)
+
+	ex.RebuildActionMap()
 
 	conn, client := getNewTestServerAndClient(t, cfg)
 
@@ -73,7 +84,7 @@ func TestGetActionsAndStart(t *testing.T) {
 
 	log.Printf("Response: %+v", respGb)
 
-	respSa, err := client.StartAction(context.Background(), &pb.StartActionRequest{ActionName: "blat"})
+	respSa, err := client.StartAction(context.Background(), &pb.StartActionRequest{ActionId: "blat"})
 
 	assert.Nil(t, err, "Empty err after start action")
 	assert.NotNil(t, respSa, "Empty err after start action")

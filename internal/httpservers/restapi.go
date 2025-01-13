@@ -2,16 +2,13 @@ package httpservers
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/reflect/protoreflect"
 	"net/http"
-
-	"github.com/golang-jwt/jwt/v4"
 
 	gw "github.com/OliveTin/OliveTin/gen/grpc"
 
@@ -23,101 +20,166 @@ var (
 	cfg *config.Config
 )
 
-func parseToken(cookieValue string) (*jwt.Token, error) {
-	return jwt.Parse(cookieValue, func(token *jwt.Token) (interface{}, error) {
-		// Don't forget to validate the alg is what you expect:
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("Unexpected signing method: %v", token.Header["alg"])
+func parseHttpHeaderForAuth(req *http.Request) (string, string) {
+	username, ok := req.Header[cfg.AuthHttpHeaderUsername]
+
+	if !ok {
+		log.Warnf("Config has AuthHttpHeaderUsername set to %v, but it was not found", cfg.AuthHttpHeaderUsername)
+
+		return "", ""
+	}
+
+	if cfg.AuthHttpHeaderUserGroup != "" {
+		usergroup, ok := req.Header[cfg.AuthHttpHeaderUserGroup]
+
+		if ok {
+			log.Debugf("HTTP Header Auth found a username and usergroup")
+
+			return username[0], usergroup[0]
+		} else {
+			log.Warnf("Config has AuthHttpHeaderUserGroup set to %v, but it was not found", cfg.AuthHttpHeaderUserGroup)
 		}
+	}
 
-		// hmacSampleSecret is a []byte containing your secret, e.g. []byte("my_secret_key")
-		return []byte(cfg.AuthJwtSecret), nil
+	log.Debugf("HTTP Header Auth found a username, but usergroup is not being used")
+
+	return username[0], ""
+}
+
+//gocyclo:ignore
+func parseRequestMetadata(ctx context.Context, req *http.Request) metadata.MD {
+	username := ""
+	usergroup := ""
+	provider := "unknown"
+	sid := ""
+
+	if cfg.AuthJwtCookieName != "" {
+		username, usergroup = parseJwtCookie(req)
+		provider = "jwt-cookie"
+	}
+
+	if cfg.AuthHttpHeaderUsername != "" && username == "" {
+		username, usergroup = parseHttpHeaderForAuth(req)
+		provider = "http-header"
+	}
+
+	if len(cfg.AuthOAuth2Providers) > 0 && username == "" {
+		username, usergroup, sid = parseOAuth2Cookie(req)
+		provider = "oauth2"
+	}
+
+	if cfg.AuthLocalUsers.Enabled && username == "" {
+		username, usergroup, sid = parseLocalUserCookie(req)
+		provider = "local"
+	}
+
+	md := metadata.New(map[string]string{
+		"username":  username,
+		"usergroup": usergroup,
+		"provider":  provider,
+		"sid":       sid,
 	})
+
+	log.Tracef("api request metadata: %+v", md)
+
+	return md
 }
 
-func getClaimsFromJwtToken(cookieValue string) (jwt.MapClaims, error) {
-	token, err := parseToken(cookieValue)
+func forwardResponseHandler(ctx context.Context, w http.ResponseWriter, msg protoreflect.ProtoMessage) error {
+	md, ok := runtime.ServerMetadataFromContext(ctx)
 
-	if err != nil {
-		log.Errorf("jwt parse failure: %v", err)
-		return nil, errors.New("jwt parse failure")
+	if !ok {
+		log.Warn("Could not get ServerMetadata from context")
+		return nil
 	}
 
-	if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
-		return claims, nil
-	} else {
-		return nil, errors.New("jwt token isn't valid")
+	forwardResponseHandlerLoginLocalUser(md.HeaderMD, w)
+	forwardResponseHandlerLogout(md.HeaderMD, w)
+
+	return nil
+}
+
+func forwardResponseHandlerLogout(md metadata.MD, w http.ResponseWriter) {
+	if getMetadataKeyOrEmpty(md, "logout-provider") != "" {
+		sid := getMetadataKeyOrEmpty(md, "logout-sid")
+
+		delete(registeredStates, sid)
+		http.SetCookie(
+			w,
+			&http.Cookie{
+				Name:  "olivetin-sid-oauth",
+				Value: "",
+			},
+		)
+
+		delete(localUserSessions, sid)
+		http.SetCookie(
+			w,
+			&http.Cookie{
+				Name:     "olivetin-sid-local",
+				MaxAge:   31556952, // 1 year
+				Value:    "",
+				HttpOnly: true,
+				Path:     "/",
+			},
+		)
+
+		w.Header().Set("Content-Type", "text/html")
+		// We cannot send a HTTP redirect here, because we don't have access to req.
+		w.Write([]byte("<script>window.location.href = '/';</script>"))
 	}
 }
 
-func lookupClaimValueOrDefault(claims jwt.MapClaims, key string, def string) string {
-	if val, ok := claims[key]; ok {
-		return fmt.Sprintf("%s", val)
-	} else {
-		return def
+func getMetadataKeyOrEmpty(md metadata.MD, key string) string {
+	mdValues := md.Get(key)
+
+	if len(mdValues) > 0 {
+		return mdValues[0]
 	}
+
+	return ""
+}
+
+func SetGlobalRestConfig(config *config.Config) {
+	cfg = config
 }
 
 func startRestAPIServer(globalConfig *config.Config) error {
 	cfg = globalConfig
 
 	log.WithFields(log.Fields{
-		"address": cfg.ListenAddressGrpcActions,
+		"address": cfg.ListenAddressRestActions,
 	}).Info("Starting REST API")
 
-	ctx := context.Background()
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	mux := newMux()
 
-	// The JSONPb.EmitDefaults is necssary, so "empty" fields are returned in JSON.
+	return http.ListenAndServe(cfg.ListenAddressRestActions, cors.AllowCors(mux))
+}
+
+func newMux() *runtime.ServeMux {
+	// The MarshalOptions set some important compatibility settings for the webui. See below.
 	mux := runtime.NewServeMux(
-		runtime.WithMetadata(func(ctx context.Context, request *http.Request) metadata.MD {
-			cookie, err := request.Cookie(cfg.AuthJwtCookieName)
-
-			if err != nil {
-				log.Debugf("jwt cookie check %v name: %v", err, cfg.AuthJwtCookieName)
-				return nil
-			}
-
-			claims, err := getClaimsFromJwtToken(cookie.Value)
-
-			log.Debugf("jwt claims data: %+v", claims)
-
-			if err != nil {
-				log.Warnf("jwt claim error: %+v", err)
-				return nil
-			}
-
-			username := lookupClaimValueOrDefault(claims, "name", "none")
-			usergroup := lookupClaimValueOrDefault(claims, "group", "none")
-
-			md := metadata.Pairs(
-				"username", username,
-				"usergroup", usergroup,
-			)
-
-			log.Debugf("jwt usable claims: %+v", md)
-
-			return md
-		}),
+		runtime.WithMetadata(parseRequestMetadata),
+		runtime.WithForwardResponseOption(forwardResponseHandler),
 		runtime.WithMarshalerOption(runtime.MIMEWildcard, &runtime.HTTPBodyMarshaler{
 			Marshaler: &runtime.JSONPb{
 				MarshalOptions: protojson.MarshalOptions{
-					UseProtoNames:   true,
-					EmitUnpopulated: true,
+					UseProtoNames:   false, // eg: canExec for js instead of can_exec from protobuf
+					EmitUnpopulated: true,  // Emit empty fields so that javascript does not get "undefined" when accessing fields with empty values.
 				},
 			},
 		}),
 	)
+
+	ctx := context.Background()
+
 	opts := []grpc.DialOption{grpc.WithInsecure()}
 
-	err := gw.RegisterOliveTinApiHandlerFromEndpoint(ctx, mux, cfg.ListenAddressGrpcActions, opts)
+	err := gw.RegisterOliveTinApiServiceHandlerFromEndpoint(ctx, mux, cfg.ListenAddressGrpcActions, opts)
 
 	if err != nil {
-		log.Errorf("Could not register REST API Handler %v", err)
-
-		return err
+		log.Panicf("Could not register REST API Handler %v", err)
 	}
 
-	return http.ListenAndServe(cfg.ListenAddressRestActions, cors.AllowCors(mux))
+	return mux
 }
